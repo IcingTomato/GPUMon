@@ -1,0 +1,176 @@
+#!/bin/bash
+# GPU Burn Stress Test with monitoring
+# Flow: start gpu_collect -> wait 10s -> run gpu-burn -d 1800 -> wait finish -> wait 10s -> stop collect
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GPU_BURN="${SCRIPT_DIR}/gpu_burn"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+CSV_OUTPUT="${SCRIPT_DIR}/gpu_burn_${TIMESTAMP}.csv"
+COLLECT_PID=""
+
+cleanup() {
+    if [ -n "$COLLECT_PID" ] && kill -0 "$COLLECT_PID" 2>/dev/null; then
+        echo "[$(date +%H:%M:%S)] Stopping gpu_collect (PID: $COLLECT_PID)..."
+        kill -TERM "$COLLECT_PID" 2>/dev/null
+        wait "$COLLECT_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+if [ ! -x "$GPU_BURN" ]; then
+    echo "Error: gpu-burn not found or not executable at $GPU_BURN"
+    exit 1
+fi
+
+if ! command -v nvidia-smi &>/dev/null; then
+    echo "Error: nvidia-smi not found"
+    exit 1
+fi
+
+if ! command -v python3 &>/dev/null; then
+    echo "Error: python3 not found"
+    exit 1
+fi
+
+echo "============================================"
+echo "  GPU Burn Stress Test"
+echo "============================================"
+echo "CSV output: $CSV_OUTPUT"
+echo ""
+
+# Step 1: Start gpu_collect.py in background
+echo "[$(date +%H:%M:%S)] Starting GPU data collection..."
+python3 - "$CSV_OUTPUT" &>/dev/null <<'PYTHON_COLLECTOR' &
+import csv
+import os
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+output = sys.argv[1]
+running = True
+
+def on_signal(signum, frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGINT, on_signal)
+signal.signal(signal.SIGTERM, on_signal)
+
+# Query GPU UUID mapping
+uuid_map = {}
+try:
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=10
+    )
+    if result.returncode == 0:
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 2:
+                uuid_map[parts[0]] = parts[1]
+except Exception:
+    pass
+
+cmd = ["nvidia-smi", "dmon", "-s", "puc", "-d", "1"]
+
+try:
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, bufsize=1)
+except FileNotFoundError:
+    sys.exit(1)
+
+columns = []
+header_parsed = False
+count = 0
+
+with open(output, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["timestamp", "gpu", "uuid", "pwr", "gtemp", "sm", "mem",
+                      "enc", "dec", "mclk", "pclk"])
+
+    try:
+        for line in proc.stdout:
+            if not running:
+                break
+
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith("#"):
+                if not header_parsed and ("gpu" in line.lower() or "idx" in line.lower()):
+                    columns = line.lstrip("# ").split()
+                    columns = [c.lower() for c in columns]
+                    header_parsed = True
+                continue
+
+            if not header_parsed:
+                continue
+
+            parts = line.split()
+            if len(parts) != len(columns):
+                continue
+
+            row = dict(zip(columns, parts))
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            gpu_idx = row.get("gpu", row.get("idx", "0"))
+            uuid = uuid_map.get(gpu_idx, "N/A")
+
+            writer.writerow([
+                now, gpu_idx, uuid,
+                row.get("pwr", "-"),
+                row.get("gtemp", "-"),
+                row.get("sm", "-"),
+                row.get("mem", "-"),
+                row.get("enc", "-"),
+                row.get("dec", "-"),
+                row.get("mclk", "-"),
+                row.get("pclk", "-"),
+            ])
+            f.flush()
+            count += 1
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+PYTHON_COLLECTOR
+COLLECT_PID=$!
+echo "[$(date +%H:%M:%S)] GPU collection started (PID: $COLLECT_PID)"
+
+# Step 2: Wait 10 seconds before starting gpu-burn
+echo "[$(date +%H:%M:%S)] Waiting 10s before starting gpu-burn..."
+sleep 10
+
+# Step 3: Run gpu-burn
+echo "[$(date +%H:%M:%S)] Starting gpu-burn -d 1800 ..."
+"$GPU_BURN" -d 1800
+BURN_EXIT=$?
+
+if [ $BURN_EXIT -eq 0 ]; then
+    echo "[$(date +%H:%M:%S)] gpu-burn completed successfully"
+else
+    echo "[$(date +%H:%M:%S)] gpu-burn exited with code $BURN_EXIT"
+fi
+
+# Step 4: Wait 10 seconds after gpu-burn finishes
+echo "[$(date +%H:%M:%S)] Waiting 10s after gpu-burn..."
+sleep 10
+
+# Step 5: Stop gpu_collect
+echo "[$(date +%H:%M:%S)] Stopping GPU data collection..."
+kill -TERM "$COLLECT_PID" 2>/dev/null
+wait "$COLLECT_PID" 2>/dev/null || true
+COLLECT_PID=""
+
+echo ""
+echo "============================================"
+echo "  Test complete"
+echo "  CSV: $CSV_OUTPUT"
+echo "============================================"
